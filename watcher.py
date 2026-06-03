@@ -1,9 +1,16 @@
-"""watcher.py — Real-time Go source watcher for GraphRAG incremental ingestion.
+"""watcher.py — Real-time source file watcher for GraphRAG incremental ingestion.
 
 This standalone script monitors the directory defined by the TARGET_GO_PROJECT
-environment variable.  When any .go file is created or modified it triggers
-an incremental re-parse of *only that file*, updating its nodes and edges in
-Neo4j without re-scanning the entire project.
+environment variable.  When any supported source file is created or modified it
+triggers an incremental re-parse of *only that file*, updating its nodes and
+edges in Neo4j without re-scanning the entire project.
+
+Supported file extensions
+-------------------------
+    .go   — Go
+    .py   — Python
+    .js   — JavaScript
+    .java — Java
 
 Usage
 -----
@@ -40,16 +47,20 @@ load_dotenv()
 
 _DEBOUNCE_SECONDS = 1.0  # Suppress duplicate OS events within this window
 
+# Extensions actively monitored for changes.
+# Must stay in sync with the keys in Neo4jGraphRAGEngine._lang_configs.
+SUPPORTED_EXTENSIONS: frozenset[str] = frozenset({".go", ".py", ".js", ".java"})
+
 
 # ── Event handler ─────────────────────────────────────────────────────────────
 
-class GoFileChangeHandler(FileSystemEventHandler):
-    """Watchdog handler that incrementally re-ingests changed .go files.
+class SourceFileChangeHandler(FileSystemEventHandler):
+    """Watchdog handler that incrementally re-ingests changed source files.
 
-    Editors typically emit 2–3 filesystem events per save (e.g. a temporary
-    swap file write followed by a rename).  A simple time-based debounce dict
-    keyed on the file path prevents redundant re-parses within the same
-    debounce window.
+    Monitors .go, .py, .js, and .java files.  Editors typically emit 2–3
+    filesystem events per save (e.g. a temporary swap file write followed by
+    a rename).  A simple time-based debounce dict keyed on the file path
+    prevents redundant re-parses within the same debounce window.
     """
 
     def __init__(self, engine: Neo4jGraphRAGEngine, watch_root: str):
@@ -61,8 +72,9 @@ class GoFileChangeHandler(FileSystemEventHandler):
 
     # ── Internal helpers ──────────────────────────────────────────────────────
 
-    def _is_go_file(self, path: str) -> bool:
-        return path.endswith(".go")
+    def _is_supported_file(self, path: str) -> bool:
+        """Return True if *path* has a file extension we know how to parse."""
+        return os.path.splitext(path)[1].lower() in SUPPORTED_EXTENSIONS
 
     def _is_debounced(self, path: str) -> bool:
         """Return True if this path was processed within the debounce window."""
@@ -71,7 +83,7 @@ class GoFileChangeHandler(FileSystemEventHandler):
 
     def _process(self, path: str) -> None:
         """Read the file and trigger an incremental Neo4j update."""
-        if not self._is_go_file(path):
+        if not self._is_supported_file(path):
             return
         if self._is_debounced(path):
             logger.debug(f"Debounced duplicate event for: {path}")
@@ -81,13 +93,14 @@ class GoFileChangeHandler(FileSystemEventHandler):
 
         # Compute the stable relative path (forward-slash normalised)
         relative_path = os.path.relpath(path, self._watch_root).replace("\\", "/")
+        ext = os.path.splitext(path)[1].lower()
 
-        logger.info(f"Change detected — re-ingesting: {relative_path}")
+        logger.info(f"Change detected ({ext}) — re-ingesting: {relative_path}")
 
         try:
             with open(path, "r", encoding="utf-8") as f:
                 code_string = f.read()
-            # Delegate to the single-file incremental parser (Task 1 upgrade)
+            # Delegate to the single-file incremental parser
             self._engine._build_graph_from_code(code_string, relative_path)
             logger.info(f"  [+] Successfully updated graph for: {relative_path}")
         except FileNotFoundError:
@@ -140,13 +153,14 @@ def main() -> None:
         raise SystemExit(1)
 
     # ── Set up the watchdog observer ──────────────────────────────────────────
-    event_handler = GoFileChangeHandler(engine=engine, watch_root=watch_root)
+    event_handler = SourceFileChangeHandler(engine=engine, watch_root=watch_root)
     observer = Observer()
     observer.schedule(event_handler, path=watch_root, recursive=True)
     observer.start()
 
+    exts = ", ".join(sorted(SUPPORTED_EXTENSIONS))
     logger.info(
-        f"Watching for .go file changes in: {watch_root}  "
+        f"Watching for changes ({exts}) in: {watch_root}  "
         f"(debounce={_DEBOUNCE_SECONDS}s)  —  Press Ctrl+C to stop."
     )
 

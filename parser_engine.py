@@ -1,7 +1,12 @@
 import os
 import logging
+from dataclasses import dataclass, field
 from dotenv import load_dotenv
+
 import tree_sitter_go as tsgo
+import tree_sitter_python as tspy
+import tree_sitter_javascript as tsjs
+import tree_sitter_java as tsjava
 from tree_sitter import Language, Parser, Query, QueryCursor
 from neo4j import GraphDatabase
 
@@ -13,12 +18,91 @@ logging.basicConfig(
 logger = logging.getLogger("parser_engine")
 
 
+@dataclass
+class _LanguageConfig:
+    """Holds the tree-sitter Language object and grammar-specific query strings
+    for one programming language.
+
+    Attributes:
+        language:        The compiled tree-sitter Language for this grammar.
+        func_queries:    One or more S-expression patterns that capture function
+                         / method *definitions*.  Each pattern must bind the
+                         capture name ``@func.name`` to the identifier node of
+                         the declared function.
+        call_queries:    One or more S-expression patterns that capture function
+                         / method *call sites*.  Each pattern must bind the
+                         capture name ``@call.name`` to the identifier (or
+                         selector) node of the callee.
+    """
+    language: Language
+    func_queries: list[str]
+    call_queries: list[str]
+
+
 class Neo4jGraphRAGEngine:
+    """Multi-language AST parser that upserts function call graphs into Neo4j.
+
+    Supported languages and their file extensions:
+        .go   — Go
+        .py   — Python
+        .js   — JavaScript  (function declarations + class methods)
+        .java — Java        (class methods)
+
+    All languages share the same unified graph schema: ``Function`` nodes keyed
+    on ``{name, filepath}`` connected by ``CALLS`` relationships.  Cypher
+    queries are therefore identical across languages.
+    """
+
     def __init__(self, uri, user, password):
-        self.go_lang = Language(tsgo.language())
-        self.parser = Parser()
-        self.parser.language = self.go_lang
         self.driver = GraphDatabase.driver(uri, auth=(user, password))
+
+        # ── Language routing table ────────────────────────────────────────────
+        # Maps file extension → _LanguageConfig.
+        # Query strings were validated by live tree-sitter AST probes against
+        # real code snippets for each grammar.
+        self._lang_configs: dict[str, _LanguageConfig] = {
+            ".go": _LanguageConfig(
+                language=Language(tsgo.language()),
+                func_queries=[
+                    "(function_declaration name: (identifier) @func.name)",
+                ],
+                call_queries=[
+                    "(call_expression function: (identifier) @call.name)",
+                    "(call_expression function: (selector_expression) @call.name)",
+                ],
+            ),
+            ".py": _LanguageConfig(
+                language=Language(tspy.language()),
+                func_queries=[
+                    "(function_definition name: (identifier) @func.name)",
+                ],
+                call_queries=[
+                    "(call function: (identifier) @call.name)",
+                ],
+            ),
+            ".js": _LanguageConfig(
+                language=Language(tsjs.language()),
+                func_queries=[
+                    # Named function declarations: function foo() {}
+                    "(function_declaration name: (identifier) @func.name)",
+                    # Class method definitions: class A { foo() {} }
+                    "(method_definition name: (property_identifier) @func.name)",
+                ],
+                call_queries=[
+                    "(call_expression function: (identifier) @call.name)",
+                    "(call_expression function: (member_expression) @call.name)",
+                ],
+            ),
+            ".java": _LanguageConfig(
+                language=Language(tsjava.language()),
+                func_queries=[
+                    "(method_declaration name: (identifier) @func.name)",
+                ],
+                call_queries=[
+                    "(method_invocation name: (identifier) @call.name)",
+                ],
+            ),
+        }
 
     def close(self):
         self.driver.close()
@@ -27,8 +111,8 @@ class Neo4jGraphRAGEngine:
         """Pulls structural context for an LLM prompt from Neo4j.
 
         Queries all Function nodes whose name matches *target_function*,
-        regardless of which file they originate from, then traverses up to
-        2 outgoing CALLS hops to collect related function names.
+        regardless of which file or language they originate from, then
+        traverses up to 2 outgoing CALLS hops to collect related function names.
         """
         query = """
         MATCH (target:Function {name: $name})-[relationship:CALLS*0..2]->(related:Function)
@@ -44,26 +128,33 @@ class Neo4jGraphRAGEngine:
         return context_nodes
 
     def ingest_directory(self, directory_path):
-        """Scans a directory for Go files and ingests them into Neo4j.
+        """Scans a directory for all supported source files and ingests them.
+
+        Supported extensions: .go, .py, .js, .java
 
         Each file is parsed independently.  The relative path from
         *directory_path* is computed and forwarded to _build_graph_from_code
         so that nodes are keyed on (name, filepath) — preventing collisions
-        between identically-named functions in different packages.
+        between identically-named functions across different files or languages.
         """
-        logger.info(f"Scanning directory: {directory_path}")
-        go_files = []
+        supported_exts = set(self._lang_configs.keys())
+        logger.info(
+            f"Scanning directory: {directory_path}  "
+            f"(supported extensions: {', '.join(sorted(supported_exts))})"
+        )
+        source_files = []
 
-        # 1. Walk the directory tree to find all .go files
+        # Walk the directory tree and collect all supported source files
         for root, _, files in os.walk(directory_path):
             for file in files:
-                if file.endswith(".go"):
-                    go_files.append(os.path.join(root, file))
+                ext = os.path.splitext(file)[1].lower()
+                if ext in supported_exts:
+                    source_files.append(os.path.join(root, file))
 
-        logger.info(f"Found {len(go_files)} Go file(s). Starting batch ingestion...")
+        logger.info(f"Found {len(source_files)} supported file(s). Starting batch ingestion...")
 
-        # 2. Process each file, passing its relative path as a stable identifier
-        for filepath in go_files:
+        # Process each file, passing its relative path as a stable identifier
+        for filepath in source_files:
             relative_path = os.path.relpath(filepath, directory_path)
             # Normalise to forward slashes for cross-platform graph portability
             relative_path = relative_path.replace("\\", "/")
@@ -78,24 +169,50 @@ class Neo4jGraphRAGEngine:
         logger.info("Batch ingestion complete.")
 
     def _build_graph_from_code(self, code_string, filepath):
-        """Parse a single Go file's AST and upsert nodes/edges into Neo4j.
+        """Parse a single source file's AST and upsert nodes/edges into Neo4j.
+
+        The correct language grammar is selected automatically from the file
+        extension embedded in *filepath*.  If the extension is not in the
+        routing table the file is skipped with a warning — no exception is
+        raised so batch ingestion continues uninterrupted.
+
+        Cypher queries are identical for all languages: Function nodes keyed on
+        ``{name, filepath}`` linked by ``CALLS`` relationships.
 
         Args:
-            code_string: Raw Go source code as a string.
-            filepath:    Relative path of the source file (used as a
-                         second dimension of the node composite key so that
-                         functions with the same name in different files
-                         remain distinct nodes in the graph).
+            code_string: Raw source code as a string.
+            filepath:    Relative path of the source file.  Used as the second
+                         dimension of the node composite key (prevents name
+                         collisions across files) and to select the language.
         """
-        tree = self.parser.parse(bytes(code_string, "utf8"))
+        ext = os.path.splitext(filepath)[1].lower()
+        config = self._lang_configs.get(ext)
+
+        if config is None:
+            logger.warning(
+                f"  [~] Skipping unsupported file extension '{ext}': {filepath}"
+            )
+            return
+
+        # Instantiate a fresh Parser for this language (cheap, stateless)
+        parser = Parser()
+        parser.language = config.language
+
+        tree = parser.parse(bytes(code_string, "utf8"))
         root_node = tree.root_node
 
-        func_query = Query(self.go_lang, "(function_declaration name: (identifier) @func.name)")
-        cursor = QueryCursor(func_query)
+        # ── Collect all function/method definitions in this file ──────────────
+        func_names_and_nodes: list[tuple[str, object]] = []
+        for func_query_str in config.func_queries:
+            func_query = Query(config.language, func_query_str)
+            cursor = QueryCursor(func_query)
+            for match_node in cursor.captures(root_node).get("func.name", []):
+                func_names_and_nodes.append(
+                    (match_node.text.decode("utf8"), match_node.parent)
+                )
 
         with self.driver.session() as session:
-            for match in cursor.captures(root_node).get("func.name", []):
-                caller_name = match.text.decode("utf8")
+            for caller_name, func_body_node in func_names_and_nodes:
 
                 # ── Node upsert: keyed on BOTH name AND filepath ──────────────
                 session.run(
@@ -104,29 +221,24 @@ class Neo4jGraphRAGEngine:
                     filepath=filepath,
                 )
 
-                call_query = Query(
-                    self.go_lang,
-                    """
-                    (call_expression function: (identifier) @call.name)
-                    (call_expression function: (selector_expression) @call.name)
-                    """,
-                )
-                call_cursor = QueryCursor(call_query)
+                # ── Collect all call sites within this function's body ─────────
+                for call_query_str in config.call_queries:
+                    call_query = Query(config.language, call_query_str)
+                    call_cursor = QueryCursor(call_query)
+                    for call_match in call_cursor.captures(func_body_node).get("call.name", []):
+                        callee_name = call_match.text.decode("utf8")
 
-                for call_match in call_cursor.captures(match.parent).get("call.name", []):
-                    callee_name = call_match.text.decode("utf8")
-
-                    # ── Edge upsert: callee lives in the same file ────────────
-                    session.run(
-                        """
-                        MERGE (caller:Function {name: $caller_name, filepath: $filepath})
-                        MERGE (callee:Function {name: $callee_name, filepath: $filepath})
-                        MERGE (caller)-[:CALLS]->(callee)
-                        """,
-                        caller_name=caller_name,
-                        callee_name=callee_name,
-                        filepath=filepath,
-                    )
+                        # ── Edge upsert: callee lives in the same file ────────
+                        session.run(
+                            """
+                            MERGE (caller:Function {name: $caller_name, filepath: $filepath})
+                            MERGE (callee:Function {name: $callee_name, filepath: $filepath})
+                            MERGE (caller)-[:CALLS]->(callee)
+                            """,
+                            caller_name=caller_name,
+                            callee_name=callee_name,
+                            filepath=filepath,
+                        )
 
 
 if __name__ == "__main__":
