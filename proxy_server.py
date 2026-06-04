@@ -5,7 +5,7 @@ import re
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from parser_engine import Neo4jGraphRAGEngine
 
 # ── Structured logging ────────────────────────────────────────────────────────
@@ -38,8 +38,8 @@ except Exception as _init_err:
         f"Reason: {_init_err}"
     )
 
-# The real LLM API endpoint we are proxying to
-TARGET_LLM_URL = "https://api.openai.com/v1/chat/completions"
+# The real LLM API endpoint we are proxying to (Updated for Google AI Studio)
+TARGET_LLM_URL = "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"
 
 
 # ── Task 2: Dynamic function-name extraction ──────────────────────────────────
@@ -140,17 +140,43 @@ async def intercept_and_augment(request: Request):
             messages[-1]["content"] += augmentation
             logger.info("Graph context injected into prompt successfully.")
 
-    # ── Forward (augmented) payload to the real LLM API ──────────────────────
+    # ── Map to Gemini and Inject Real Key ─────────────────────────────────────
+    # Force the model to use a free Gemini engine since Continue sends 'gpt-4'
+    payload["model"] = "gemini-2.5-flash"
+
+    # Override the fake-key from Continue with your real Google AI Studio key
+    gemini_key = os.getenv("LLM_API_KEY")
     headers = {
-        "Authorization": request.headers.get("Authorization"),
+        "Authorization": f"Bearer {gemini_key}",
         "Content-Type": "application/json",
     }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(TARGET_LLM_URL, json=payload, headers=headers)
+    # ── Map to Gemini and Inject Real Key ─────────────────────────────────────
+    # Force the model to use a free Gemini engine
+    payload["model"] = "gemini-2.5-flash"
+    
+    # Force streaming mode so Continue renders the text in real-time
+    payload["stream"] = True
 
-    # Return the LLM's response back to the IDE
-    return JSONResponse(content=response.json(), status_code=response.status_code)
+    # NEW: Strip Continue's restrictive word-count limits from the payload
+    payload.pop("max_tokens", None)
+    payload.pop("max_completion_tokens", None)
+
+    gemini_key = os.getenv("LLM_API_KEY")
+    headers = {
+        "Authorization": f"Bearer {gemini_key}",
+        "Content-Type": "application/json",
+    }
+
+    # Create a real-time streaming pipe from Gemini -> Proxy -> VS Code
+    async def stream_generator():
+        async with httpx.AsyncClient(timeout=None) as client:
+            async with client.stream("POST", TARGET_LLM_URL, json=payload, headers=headers) as response:
+                async for chunk in response.aiter_bytes():
+                    yield chunk
+
+    # Return the live stream back to the IDE
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
 
 if __name__ == "__main__":
